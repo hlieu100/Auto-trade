@@ -26,6 +26,7 @@ from tenacity import (
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
+    LimitOrderRequest,
     ClosePositionRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -176,6 +177,37 @@ def place_market_order(
             "qty":      qty,
             "status":   order.status,
         },
+    )
+    return order
+
+
+@_retry
+def place_limit_order(
+    ticker: str,
+    side: OrderSide,
+    qty: float,
+    limit_price: float,
+) -> Order:
+    """Submit a day limit order at limit_price."""
+    qty = _sanitise_qty(qty)
+
+    req = LimitOrderRequest(
+        symbol=ticker,
+        qty=qty,
+        side=side,
+        time_in_force=TimeInForce.DAY,
+        limit_price=round(limit_price, 2),
+    )
+
+    log.info(
+        "Submitting limit order",
+        extra={"ticker": ticker, "side": side.value, "qty": qty, "limit": limit_price},
+    )
+    order = get_client().submit_order(req)
+    log.info(
+        "Limit order accepted",
+        extra={"order_id": str(order.id), "ticker": ticker, "side": side.value,
+               "qty": qty, "limit": limit_price, "status": order.status},
     )
     return order
 

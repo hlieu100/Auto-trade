@@ -15,10 +15,11 @@ class TradingAction(str, Enum):
     REVERSE_TO_LONG  = "reverse_to_long"
     REVERSE_TO_SHORT = "reverse_to_short"
     # ── Kimi strategy actions ─────────────────────────────────────────────────
-    BASE_ENTRY       = "base_entry"       # First entry — you place manually, bot ignores
-    ADD_LEVERAGE     = "add_leverage"     # DD buy — bot calculates qty from Alpaca balance
-    REMOVE_LEVERAGE  = "remove_leverage"  # DD sell — bot closes "Leverage" position
-    STOP_LOSS        = "stop_loss"        # Full close — bot closes all positions
+    BASE_ENTRY       = "base_entry"       # First entry — buy 100% of buying power
+    ADD_LEVERAGE     = "add_leverage"     # DD buy — 50% of buying power
+    REMOVE_LEVERAGE  = "remove_leverage"  # DD sell — close only the DD shares
+    TAKE_PROFIT      = "take_profit"      # 5% gain hit — close all positions
+    STOP_LOSS        = "stop_loss"        # Full close — close all positions
 
 
 class AlertPayload(BaseModel):
@@ -41,6 +42,9 @@ class AlertPayload(BaseModel):
 
     # Current bar close price — used for Kimi DD sizing
     price: Optional[float] = None
+
+    # Mid price (high+low)/2 — used as limit price for Kimi orders
+    limit: Optional[float] = None
 
     # TradingView strategy order ID — used as idempotency key
     order_id: Optional[str] = None
