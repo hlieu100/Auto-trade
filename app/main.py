@@ -30,7 +30,7 @@ from app.logging_config import setup_logging
 from app.models import AlertPayload
 from app.notifications import notify
 from app.security import verify_webhook_secret
-from app.trading.order_logic import execute_action
+from app.trading.order_logic import handle_signal
 from alpaca.common.exceptions import APIError
 
 # ── Logging must be set up before the first log call ─────────────────────────
@@ -54,8 +54,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TradingView → Alpaca Webhook",
-    version="1.0.0",
-    docs_url=None,   # Disable Swagger UI in production (re-enable for dev)
+    version="2.0.0",
+    docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
 )
@@ -78,9 +78,9 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 async def health():
     """Liveness / readiness probe. Returns 200 while the server is up."""
     return {
-        "status":  "ok",
+        "status": "ok",
         "uptime_s": round(time.time() - _start_time, 1),
-        "paper":   "paper" in settings.alpaca_base_url,
+        "paper": "paper" in settings.alpaca_base_url,
     }
 
 
@@ -90,11 +90,11 @@ async def webhook(request: Request):
     Main TradingView alert receiver.
 
     Flow:
-      1. Parse raw JSON (surface parse errors early).
+      1. Parse raw JSON.
       2. Validate secret.
-      3. Parse + validate the full AlertPayload.
-      4. Reject duplicates.
-      5. Execute trading action via Alpaca.
+      3. Validate AlertPayload.
+      4. Reject duplicates when order_id is present.
+      5. Let Render decide what to do via handle_signal().
       6. Return structured response.
     """
     # ── 1. Raw JSON parse ─────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ async def webhook(request: Request):
     received_secret = raw.get("secret", "")
     try:
         verify_webhook_secret(received_secret)
-    except Exception as exc:
+    except Exception:
         log.warning("Alert rejected — bad secret", extra={"ip": _client_ip(request)})
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -131,18 +131,20 @@ async def webhook(request: Request):
         )
 
     log.info(
-        "Alert received",
+        "Signal received",
         extra={
-            "ticker":    payload.ticker,
-            "action":    payload.action,
-            "contracts": payload.contracts,
-            "order_id":  payload.order_id,
+            "ticker": payload.ticker,
+            "signal": getattr(payload, "signal", None),
+            "action": getattr(payload, "action", None),
+            "qty": getattr(payload, "qty", None),
+            "contracts": getattr(payload, "contracts", None),
+            "order_id": payload.order_id,
             "timestamp": payload.timestamp,
         },
     )
 
     # ── 4. Idempotency check ──────────────────────────────────────────────────
-    if is_duplicate(payload):
+    if payload.order_id and is_duplicate(payload):
         log.info(
             "Duplicate alert ignored",
             extra={"ticker": payload.ticker, "order_id": payload.order_id},
@@ -152,19 +154,26 @@ async def webhook(request: Request):
             content={"status": "duplicate", "message": "Alert already processed."},
         )
 
-    # ── 5. Execute trade ──────────────────────────────────────────────────────
+    # ── 5. Handle signal (Render is source of truth) ─────────────────────────
     try:
-        result = await execute_action(payload)
-        mark_processed(payload)
+        result = await handle_signal(payload)
+
+        if payload.order_id:
+            mark_processed(payload)
 
         log.info(
-            "Trade executed",
-            extra={"ticker": payload.ticker, "action": payload.action, "result": result},
+            "Signal handled",
+            extra={
+                "ticker": payload.ticker,
+                "signal": getattr(payload, "signal", None),
+                "action": getattr(payload, "action", None),
+                "result": result,
+            },
         )
 
         await notify(
-            f"✅ <b>{payload.action.upper()}</b> {payload.ticker} "
-            f"| qty={payload.contracts} | price≈{payload.price}"
+            f"✅ <b>{getattr(payload, 'signal', getattr(payload, 'action', 'unknown')).upper()}</b> "
+            f"{payload.ticker} | result={result.get('status')}"
         )
 
         return JSONResponse(
@@ -173,9 +182,12 @@ async def webhook(request: Request):
         )
 
     except ValueError as exc:
-        # Bad input (e.g. qty = 0), not an Alpaca error
-        log.warning("Trade rejected — bad value: %s", exc, extra={"ticker": payload.ticker})
-        await notify(f"⚠️ Trade rejected for {payload.ticker}: {exc}")
+        log.warning(
+            "Signal rejected — bad value: %s",
+            exc,
+            extra={"ticker": payload.ticker},
+        )
+        await notify(f"⚠️ Signal rejected for {payload.ticker}: {exc}")
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={"error": str(exc)},
@@ -185,7 +197,7 @@ async def webhook(request: Request):
         log.error(
             "Alpaca API error",
             exc_info=True,
-            extra={"ticker": payload.ticker, "action": payload.action},
+            extra={"ticker": payload.ticker},
         )
         await notify(f"❌ Alpaca error for {payload.ticker}: {exc}")
         return JSONResponse(
@@ -220,5 +232,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=settings.port,
         reload=False,
-        log_config=None,  # We manage logging ourselves
+        log_config=None,
     )
