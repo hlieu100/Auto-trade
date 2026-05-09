@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     # enabled AND the symbol supports it.
     allow_fractional_shares: bool = False
 
+    # ── Options trading ───────────────────────────────────────────────────────
+    # Must be True to process buy_call / close_call signals.
+    # Requires Options Level 2 approval on your Alpaca account.
+    options_enabled: bool = False
+
+    # Minutes before an unfilled limit order is cancelled and replaced with market.
+    option_limit_timeout_min: int = 5
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
 

@@ -8,11 +8,16 @@ Render checks Alpaca account/position and decides what to do.
 
 Supported signals
 ─────────────────
-base_entry      → if no position exists, open a long position
-add_leverage    → if long position exists, add to it
-remove_leverage → if long position exists, trim it
-stop_loss       → if position exists, close all
-support_notice  → notification only, no trade
+Stock signals:
+  base_entry      → if no position exists, open a long position
+  add_leverage    → if long position exists, add to it
+  remove_leverage → if long position exists, trim it
+  stop_loss       → if position exists, close all
+  support_notice  → notification only, no trade
+
+Options signals (routed to option_logic.py):
+  buy_call        → find ATM call contract, limit order at mid-price
+  close_call      → close option positions (limit @ mid or market for stop loss)
 """
 
 import logging
@@ -23,13 +28,16 @@ from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderSide
 from alpaca.trading.models import Order
 
+from app.config import settings
 from app.models import AlertPayload
 from app.trading import alpaca_client as ac
+from app.trading.option_logic import handle_option_signal
 
 log = logging.getLogger(__name__)
 
-# Must match your Pine-side leverage factor if you still want "add" sizing logic.
 LEVERAGE_FACTOR = 0.5
+
+_OPTION_ACTIONS = {"buy_call", "close_call"}
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -41,7 +49,7 @@ async def handle_signal(payload: AlertPayload) -> dict:
     Pine sends a signal.
     We query Alpaca and decide whether to buy, add, trim, close, or ignore.
     """
-    signal = getattr(payload, "signal", None) or getattr(payload, "action", None)
+    signal = payload.resolved_signal()
     ticker = payload.ticker
     requested_qty = _extract_requested_qty(payload)
 
@@ -50,7 +58,19 @@ async def handle_signal(payload: AlertPayload) -> dict:
         extra={"signal": signal, "ticker": ticker, "requested_qty": requested_qty},
     )
 
-    account = ac.get_account()
+    # ── Route options signals ─────────────────────────────────────────────────
+    if signal in _OPTION_ACTIONS:
+        if not settings.options_enabled:
+            return {
+                "signal": signal,
+                "ticker": ticker,
+                "status": "ignored",
+                "note":   "Options trading is disabled. Set OPTIONS_ENABLED=true to enable.",
+            }
+        return await handle_option_signal(payload)
+
+    # ── Stock signals below ───────────────────────────────────────────────────
+    account  = ac.get_account()
     position = ac.get_position(ticker)
 
     result: Dict[str, Any] = {
@@ -59,25 +79,25 @@ async def handle_signal(payload: AlertPayload) -> dict:
         "orders": [],
     }
 
-    # ── Notification only ────────────────────────────────────────────────────
+    # ── Notification only ─────────────────────────────────────────────────────
     if signal == "support_notice":
         result["status"] = "notified_only"
-        result["note"] = "Support notice received. No trade sent to Alpaca."
+        result["note"]   = "Support notice received. No trade sent to Alpaca."
         result["position_exists"] = position is not None
         return result
 
-    # ── Base entry ───────────────────────────────────────────────────────────
+    # ── Base entry ────────────────────────────────────────────────────────────
     if signal == "base_entry":
         if position is not None:
             result["status"] = "ignored"
-            result["note"] = "Base entry ignored — Alpaca already has a position."
+            result["note"]   = "Base entry ignored — Alpaca already has a position."
             result["current_position_qty"] = _position_qty(position)
             return result
 
         qty = _resolve_base_qty(account, ticker, payload)
         if qty <= 0:
             result["status"] = "ignored"
-            result["note"] = "Base entry ignored — computed qty <= 0."
+            result["note"]   = "Base entry ignored — computed qty <= 0."
             return result
 
         order = _place_buy(ticker, qty, payload.limit)
@@ -85,22 +105,22 @@ async def handle_signal(payload: AlertPayload) -> dict:
         result["status"] = "submitted"
         return result
 
-    # ── Add leverage ─────────────────────────────────────────────────────────
+    # ── Add leverage ──────────────────────────────────────────────────────────
     if signal == "add_leverage":
         if position is None:
             result["status"] = "ignored"
-            result["note"] = "Add ignored — no Alpaca position exists."
+            result["note"]   = "Add ignored — no Alpaca position exists."
             return result
 
         if not _is_long_position(position):
             result["status"] = "ignored"
-            result["note"] = "Add ignored — current Alpaca position is not long."
+            result["note"]   = "Add ignored — current Alpaca position is not long."
             return result
 
         qty = _resolve_add_qty(account, ticker, payload)
         if qty <= 0:
             result["status"] = "ignored"
-            result["note"] = "Add ignored — computed qty <= 0."
+            result["note"]   = "Add ignored — computed qty <= 0."
             return result
 
         order = _place_buy(ticker, qty, payload.limit)
@@ -108,28 +128,28 @@ async def handle_signal(payload: AlertPayload) -> dict:
         result["status"] = "submitted"
         return result
 
-    # ── Remove leverage / trim ───────────────────────────────────────────────
+    # ── Remove leverage / trim ────────────────────────────────────────────────
     if signal == "remove_leverage":
         if position is None:
             result["status"] = "ignored"
-            result["note"] = "Trim ignored — no Alpaca position exists."
+            result["note"]   = "Trim ignored — no Alpaca position exists."
             return result
 
         if not _is_long_position(position):
             result["status"] = "ignored"
-            result["note"] = "Trim ignored — current Alpaca position is not long."
+            result["note"]   = "Trim ignored — current Alpaca position is not long."
             return result
 
         current_qty = _position_qty(position)
         if current_qty <= 0:
             result["status"] = "ignored"
-            result["note"] = "Trim ignored — current quantity is zero."
+            result["note"]   = "Trim ignored — current quantity is zero."
             return result
 
         qty = _resolve_trim_qty(current_qty, requested_qty)
         if qty <= 0:
             result["status"] = "ignored"
-            result["note"] = "Trim ignored — trim qty <= 0."
+            result["note"]   = "Trim ignored — trim qty <= 0."
             return result
 
         order = _place_sell(ticker, qty, payload.limit)
@@ -137,11 +157,11 @@ async def handle_signal(payload: AlertPayload) -> dict:
         result["status"] = "submitted"
         return result
 
-    # ── Stop loss / hard close ───────────────────────────────────────────────
+    # ── Stop loss / hard close ────────────────────────────────────────────────
     if signal == "stop_loss":
         if position is None:
             result["status"] = "ignored"
-            result["note"] = "Stop loss ignored — no Alpaca position exists."
+            result["note"]   = "Stop loss ignored — no Alpaca position exists."
             return result
 
         order = ac.close_position(ticker)
@@ -150,7 +170,7 @@ async def handle_signal(payload: AlertPayload) -> dict:
             result["status"] = "submitted"
         else:
             result["status"] = "ignored"
-            result["note"] = "Stop loss ignored — no close order was created."
+            result["note"]   = "Stop loss ignored — no close order was created."
         return result
 
     raise ValueError(f"Unsupported signal/action: {signal}")
@@ -159,16 +179,9 @@ async def handle_signal(payload: AlertPayload) -> dict:
 # ── Qty resolution ────────────────────────────────────────────────────────────
 
 def _extract_requested_qty(payload: AlertPayload) -> float:
-    """
-    Support either:
-    - payload.qty
-    - payload.contracts
-    Return 0 if neither exists.
-    """
     raw_qty = getattr(payload, "qty", None)
     if raw_qty is None:
         raw_qty = getattr(payload, "contracts", None)
-
     try:
         return float(raw_qty) if raw_qty is not None else 0.0
     except Exception:
@@ -176,13 +189,9 @@ def _extract_requested_qty(payload: AlertPayload) -> float:
 
 
 def _effective_price(ticker: str, price: Optional[float], limit: Optional[float]) -> float:
-    """
-    Use limit if given, else price if given, else fetch latest Alpaca price.
-    """
     p = limit or price
     if p and p > 0:
         return float(p)
-
     fetched = ac.get_latest_price(ticker)
     if not fetched:
         raise ValueError(f"Could not determine price for {ticker}")
@@ -190,41 +199,26 @@ def _effective_price(ticker: str, price: Optional[float], limit: Optional[float]
 
 
 def _resolve_base_qty(account, ticker: str, payload: AlertPayload) -> int:
-    """
-    Prefer Pine-provided qty if valid.
-    Otherwise compute from Alpaca buying power and effective price.
-    """
     requested_qty = _extract_requested_qty(payload)
     if requested_qty > 0:
         return math.floor(requested_qty)
-
     buying_power = float(account.buying_power)
-    exec_price = _effective_price(ticker, payload.price, payload.limit)
+    exec_price   = _effective_price(ticker, payload.price, payload.limit)
     return math.floor(buying_power / exec_price)
 
 
 def _resolve_add_qty(account, ticker: str, payload: AlertPayload) -> int:
-    """
-    Prefer Pine-provided qty if valid.
-    Otherwise compute using leverage factor from Alpaca buying power.
-    """
     requested_qty = _extract_requested_qty(payload)
     if requested_qty > 0:
         return math.floor(requested_qty)
-
     buying_power = float(account.buying_power)
-    exec_price = _effective_price(ticker, payload.price, payload.limit)
+    exec_price   = _effective_price(ticker, payload.price, payload.limit)
     return math.floor((buying_power * LEVERAGE_FACTOR) / exec_price)
 
 
 def _resolve_trim_qty(current_qty: float, requested_qty: float) -> int:
-    """
-    If Pine sent a qty, trim that much up to current position.
-    If Pine did not send qty, trim half the current position by default.
-    """
     if requested_qty > 0:
         return math.floor(min(current_qty, requested_qty))
-
     return math.floor(max(1, current_qty / 2))
 
 
@@ -260,9 +254,9 @@ def _place_sell(ticker: str, qty: int, limit: Optional[float]) -> Order:
 def _order_summary(order: Order) -> dict:
     return {
         "alpaca_order_id": str(order.id),
-        "symbol": order.symbol,
-        "side": str(order.side),
-        "qty": str(order.qty),
-        "type": str(order.order_type),
-        "status": str(order.status),
+        "symbol":          order.symbol,
+        "side":            str(order.side),
+        "qty":             str(order.qty),
+        "type":            str(order.order_type),
+        "status":          str(order.status),
     }
